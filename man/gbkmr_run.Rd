@@ -44,7 +44,10 @@ gbkmr_run(
 
 \item{iter}{Integer. Total MCMC iterations.}
 
-\item{n_knots}{Integer. Knots for kernel approximation.}
+\item{n_knots}{Integer or NULL. Knots for the BKMR predictive-process
+approximation (standard engine only). NULL or 0 fits the exact Gaussian
+process as in Chai et al.: slower, but the knot approximation narrows the
+posterior intervals and lowers their coverage.}
 
 \item{engine}{Character. "auto" (default), "bkmr", or "fastbkmr". When
 "auto", the engine is selected based on sample size and outcome type:
@@ -54,8 +57,11 @@ confounders; fast BKMR for large all-Gaussian analyses if fbkmr is installed.}
 \item{n_subset}{Integer or NULL. Number of subsets for fastBKMR. If NULL
 (default), auto-calculated as max(5, floor(n / 1000)).}
 
-\item{n_cores}{Integer or NULL. Number of parallel cores for fastBKMR.
-If NULL (default), auto-calculated as min(n_subset, available cores, 10).}
+\item{n_cores}{Integer or NULL. For fastBKMR, cores for the subset fits
+(NULL = min(n_subset, available cores, 10)). For standard BKMR, forked
+workers (\code{parallel::mclapply}) for the model fits and the Monte Carlo
+g-computation (NULL = 1, serial; always 1 on Windows). Results do not
+depend on the number of workers.}
 
 \item{a_probs}{Numeric vector of length 2. Quantile probabilities for
 intervention levels (default: c(0.25, 0.75)).}

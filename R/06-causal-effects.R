@@ -92,18 +92,37 @@ utils::globalVariables(".data")
   sweep(out, 2L, scale_info$scale, FUN = "/")
 }
 
-.gbkmr_sample_pred <- function(fit, Znew, Xnew, sel, type = "link") {
+# Posterior-predictive draw of h(z) + x'beta at MCMC iteration sel_j for each of
+# K blocks of new rows (one block per Monte Carlo sample, n_regimes rows each).
+# The seed is reset before every SamplePred() call, so the K blocks reuse the
+# same standard-normal innovations (common random numbers, as in Chai et al.'s
+# per-sample seed reset); this couples the posterior-uncertainty component
+# across the Monte Carlo sample instead of averaging it away with K
+# independent draws. Identical blocks are evaluated once. Returns a
+# K x n_regimes matrix and the residual SD of the same posterior draw; when
+# fastBKMR supplies a list of subset fits, one subset is chosen
+# (deterministically from the seed) and used for both.
+.gbkmr_predict_blocks <- function(fit, blocks, Xnew, sel_j, seed, type = "link") {
+  set.seed(seed)
   if (is.list(fit) && !inherits(fit, "bkmrfit")) {
     fit <- fit[[sample.int(length(fit), 1L)]]
   }
-  bkmr::SamplePred(fit, Znew = Znew, Xnew = Xnew, sel = sel, type = type)
+  keys <- vapply(blocks, function(b) paste(b, collapse = "\r"), character(1))
+  unique_pos <- which(!duplicated(keys))
+  group <- match(keys, keys[unique_pos])
+  out <- matrix(NA_real_, nrow = length(blocks), ncol = nrow(blocks[[1]]))
+  for (u in seq_along(unique_pos)) {
+    set.seed(seed)
+    pr <- bkmr::SamplePred(fit, Znew = blocks[[unique_pos[u]]], Xnew = Xnew,
+                           sel = sel_j, type = type)
+    hit <- which(group == u)
+    out[hit, ] <- matrix(as.numeric(pr), nrow = length(hit), ncol = ncol(out),
+                         byrow = TRUE)
+  }
+  list(pred = out, sigma = sqrt(fit$sigsq.eps[sel_j]))
 }
 
-.gbkmr_seed <- function(seed, stage, t = 0L, variable = 0L, draw = 0L, mc = 0L) {
-  value <- seed + stage * 1000003 + t * 10007 + variable * 1009 +
-    draw * 101 + mc
-  as.integer(value %% .Machine$integer.max)
-}
+# .gbkmr_seed() is defined in 04-core-analysis.R and shared with gbkmr_run().
 
 .gbkmr_validate_interventions <- function(raw, interventions) {
   if (is.data.frame(interventions)) interventions <- as.matrix(interventions)
@@ -165,6 +184,16 @@ utils::globalVariables(".data")
     confounder_types <- rep("continuous", n_confounders)
   }
 
+  # Same Monte Carlo scheme as run_gbkmr_panel(): common random numbers for
+  # the posterior-function draw across the K Monte Carlo samples of each
+  # posterior draw, and continuous confounders drawn from the fitted
+  # conditional distribution (mean + sigma_j * eps). Draws are seeded per
+  # (seed, draw, time, confounder), so results do not depend on the number of
+  # workers. Workers default to the fit's n_cores; override with
+  # options(causalBKMR.cores = 1) e.g. when forking is unavailable.
+  mc_cores <- .gbkmr_mc_cores(getOption("causalBKMR.cores", .gbkmr_or(meta$mc_cores, 1L)))
+  lapply_mc <- function(X, FUN) .gbkmr_lapply_mc(X, FUN, mc_cores)
+
   L_samples <- vector("list", length(confounder_times))
   if (length(confounder_times) > 0L) names(L_samples) <- paste0("L", confounder_times)
 
@@ -173,12 +202,12 @@ utils::globalVariables(".data")
     exposure_history <- interventions[, seq_len(t * meta$p), drop = FALSE]
 
     for (li in seq_len(n_confounders)) {
-      sampled <- array(NA_real_, dim = c(n_draws, K, n_regimes))
       fit_li <- raw$fit_confounders[[t]][[li]]
       scale_info <- state$confounder_scale_info[[t]]
+      is_binary <- confounder_types[[li]] == "binary"
 
-      for (j in seq_len(n_draws)) {
-        for (k in seq_len(K)) {
+      per_draw <- lapply_mc(seq_len(n_draws), function(j) {
+        blocks <- lapply(seq_len(K), function(k) {
           if (t > 1L) {
             history <- do.call(cbind, lapply(seq_len(t - 1L), function(tt) {
               do.call(cbind, lapply(seq_len(n_confounders), function(lj) {
@@ -189,31 +218,40 @@ utils::globalVariables(".data")
           } else {
             newz <- exposure_history
           }
+          .gbkmr_scale_matrix(newz, scale_info)
+        })
 
-          newz <- .gbkmr_scale_matrix(newz, scale_info)
-          set.seed(.gbkmr_seed(seed, 1L, t, li, j, k))
-          if (confounder_types[[li]] == "binary") {
-            probabilities <- as.numeric(.gbkmr_sample_pred(
-              fit_li, newz, state$baseline_predictors, sel[j], type = "response"
-            ))
-            probabilities <- pmin(pmax(probabilities, 0), 1)
-            sampled[j, k, ] <- stats::rbinom(n_regimes, 1L, probabilities)
-          } else {
-            sampled[j, k, ] <- as.numeric(.gbkmr_sample_pred(
-              fit_li, newz, state$baseline_predictors, sel[j]
-            ))
-          }
+        pred <- .gbkmr_predict_blocks(
+          fit_li, blocks, state$baseline_predictors, sel[j],
+          seed = .gbkmr_seed(seed, 1L, t, li, j),
+          type = if (is_binary) "response" else "link"
+        )
+
+        # The K residual draws (or Bernoulli uniforms) are shared by all
+        # regimes (common random numbers): a regime's confounder draw then
+        # depends only on its own kernel inputs, not on which other regimes
+        # are evaluated in the same call, and contrasts between regimes carry
+        # less Monte Carlo noise. gbkmr_run() instead uses independent noise
+        # for a and a*, as in Chai et al.
+        set.seed(.gbkmr_seed(seed, 3L, t, li, j))
+        if (is_binary) {
+          u <- stats::runif(K)
+          (u < pmin(pmax(pred$pred, 0), 1)) * 1
+        } else {
+          pred$pred + pred$sigma * stats::rnorm(K)
         }
-      }
+      })
+
+      sampled <- array(NA_real_, dim = c(n_draws, K, n_regimes))
+      for (j in seq_len(n_draws)) sampled[j, , ] <- per_draw[[j]]
       L_samples_t[[li]] <- sampled
     }
     L_samples[[t]] <- L_samples_t
     if (isTRUE(verbose)) message("Generated confounders for t = ", t)
   }
 
-  outcome_samples <- array(NA_real_, dim = c(n_draws, K, n_regimes))
-  for (j in seq_len(n_draws)) {
-    for (k in seq_len(K)) {
+  per_draw_y <- lapply_mc(seq_len(n_draws), function(j) {
+    blocks <- lapply(seq_len(K), function(k) {
       if (length(confounder_times) > 0L && n_confounders > 0L) {
         confounder_history <- do.call(cbind, lapply(confounder_times, function(t) {
           do.call(cbind, lapply(seq_len(n_confounders), function(li) {
@@ -224,19 +262,19 @@ utils::globalVariables(".data")
       } else {
         newz <- interventions
       }
+      .gbkmr_scale_matrix(newz, state$outcome_scale_info)
+    })
+    pred <- .gbkmr_predict_blocks(
+      raw$fit_y, blocks, state$baseline_predictors, sel[j],
+      seed = .gbkmr_seed(seed, 2L, draw = j)
+    )$pred
+    if (meta$outcome_type == "binary") pred <- stats::pnorm(pred)
+    pred
+  })
+  if (isTRUE(verbose)) message("Completed ", n_draws, " posterior draws")
 
-      newz <- .gbkmr_scale_matrix(newz, state$outcome_scale_info)
-      set.seed(.gbkmr_seed(seed, 2L, draw = j, mc = k))
-      predictions <- as.numeric(.gbkmr_sample_pred(
-        raw$fit_y, newz, state$baseline_predictors, sel[j]
-      ))
-      if (meta$outcome_type == "binary") predictions <- stats::pnorm(predictions)
-      outcome_samples[j, k, ] <- predictions
-    }
-    if (isTRUE(verbose) && (j %% max(1L, floor(n_draws / 10L)) == 0L)) {
-      message("Completed posterior draw ", j, " of ", n_draws)
-    }
-  }
+  outcome_samples <- array(NA_real_, dim = c(n_draws, K, n_regimes))
+  for (j in seq_len(n_draws)) outcome_samples[j, , ] <- per_draw_y[[j]]
 
   draw_means <- matrix(NA_real_, nrow = n_draws, ncol = n_regimes)
   for (r in seq_len(n_regimes)) {

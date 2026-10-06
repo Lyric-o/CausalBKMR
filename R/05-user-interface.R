@@ -156,7 +156,13 @@ print_input_audit <- function(data, outcome, outcome_type, time_points,
                 n_subset, as.integer(n / n_subset), n_cores))
   }
   if (engine == "bkmr") {
-    cat(sprintf("  Knots:           %d (Gaussian process approximation)\n", n_knots))
+    if (!is.null(n_knots) && is.finite(n_knots) && n_knots > 0) {
+      cat(sprintf("  Knots:           %d (predictive-process approximation; narrows intervals)\n", n_knots))
+    } else {
+      cat("  Knots:           none (exact Gaussian process, as in Chai et al.)\n")
+    }
+    cat(sprintf("  Workers:         %d (model fits + Monte Carlo g-computation)\n",
+                .gbkmr_mc_cores(n_cores)))
   }
   cat(sprintf("  Sample size:     %d\n", n))
   cat(sprintf("  MCMC iterations: %d\n", iter))
@@ -190,15 +196,21 @@ print_input_audit <- function(data, outcome, outcome_type, time_points,
 #'   `data` are used.
 #' @param K Integer. Monte Carlo samples.
 #' @param iter Integer. Total MCMC iterations.
-#' @param n_knots Integer. Knots for kernel approximation.
+#' @param n_knots Integer or NULL. Knots for the BKMR predictive-process
+#'   approximation (standard engine only). NULL or 0 fits the exact Gaussian
+#'   process as in Chai et al.: slower, but the knot approximation narrows the
+#'   posterior intervals and lowers their coverage.
 #' @param engine Character. "auto" (default), "bkmr", or "fastbkmr". When
 #'   "auto", the engine is selected based on sample size and outcome type:
 #'   standard BKMR for n <= 2000, binary outcomes, or binary time-varying
 #'   confounders; fast BKMR for large all-Gaussian analyses if fbkmr is installed.
 #' @param n_subset Integer or NULL. Number of subsets for fastBKMR. If NULL
 #'   (default), auto-calculated as max(5, floor(n / 1000)).
-#' @param n_cores Integer or NULL. Number of parallel cores for fastBKMR.
-#'   If NULL (default), auto-calculated as min(n_subset, available cores, 10).
+#' @param n_cores Integer or NULL. For fastBKMR, cores for the subset fits
+#'   (NULL = min(n_subset, available cores, 10)). For standard BKMR, forked
+#'   workers (\code{parallel::mclapply}) for the model fits and the Monte Carlo
+#'   g-computation (NULL = 1, serial; always 1 on Windows). Results do not
+#'   depend on the number of workers.
 #' @param a_probs Numeric vector of length 2. Quantile probabilities for
 #'   intervention levels (default: c(0.25, 0.75)).
 #' @param a_vals Named numeric vector or NULL. Custom low-exposure values.
@@ -300,8 +312,12 @@ gbkmr_run <- function(
     if (is.null(n_cores))  n_cores  <- min(n_subset, parallel::detectCores() - 1L, 10L)
   } else {
     if (is.null(n_subset)) n_subset <- 10L
-    if (is.null(n_cores))  n_cores  <- 10L
+    # Serial by default; n_cores > 1 forks workers for the model fits and the
+    # Monte Carlo g-computation (results are identical for any n_cores).
+    if (is.null(n_cores))  n_cores  <- 1L
   }
+  use_knots <- !is.null(n_knots) && is.finite(n_knots) && n_knots > 0
+  if (!use_knots) n_knots <- NULL
 
 
   # Print full input audit so user knows what the package understood
@@ -373,6 +389,8 @@ gbkmr_run <- function(
       sample_size = n,
       mcmc_iterations = iter,
       engine = engine,
+      n_knots = n_knots,
+      n_cores = n_cores,
       confounder_types = confounder_types,
       a_probs = a_probs
     )

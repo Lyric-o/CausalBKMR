@@ -126,6 +126,13 @@ fit <- gbkmr_run(
 )
 ```
 
+`n_knots = 50` uses the predictive-process approximation to the Gaussian
+process. It is faster, but it narrows the posterior intervals and lowers their
+coverage; `n_knots = NULL` fits the exact Gaussian process as in Chai et al.
+With `engine = "bkmr"`, `n_cores` forks that many workers for the model fits
+and the Monte Carlo g-computation (`parallel::mclapply`, not available on
+Windows); results do not depend on `n_cores`.
+
 `engine = "auto"` selects standard BKMR for `n <= 2000`, binary
 outcomes, or binary time-varying confounders. For larger all-Gaussian
 analyses it uses `fastbkmr` only if the `fbkmr` package is installed.

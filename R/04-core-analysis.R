@@ -1,5 +1,56 @@
 # Core g-BKMR analysis implementation
 
+# Number of forked workers to use for the standard-BKMR path. Forking is not
+# available on Windows, so the work runs serially there.
+.gbkmr_mc_cores <- function(n_cores) {
+  if (is.null(n_cores) || !is.numeric(n_cores) || length(n_cores) != 1L ||
+      !is.finite(n_cores) || n_cores < 1) {
+    return(1L)
+  }
+  if (.Platform$OS.type == "windows") return(1L)
+  available <- suppressWarnings(parallel::detectCores())
+  if (is.na(available) || available < 1) available <- 1L
+  as.integer(max(1L, min(n_cores, available)))
+}
+
+# lapply() over posterior draws / model fits, forked when mc_cores > 1. Every
+# FUN call seeds its own RNG, so the result is the same for any mc_cores.
+# mclapply() reports an R error as a "try-error" element and a killed worker
+# (e.g. by the out-of-memory killer) as NULL plus a warning; both are turned
+# into errors here because downstream code would otherwise silently drop the
+# missing draws.
+.gbkmr_lapply_mc <- function(X, FUN, mc_cores) {
+  if (mc_cores <= 1L) return(lapply(X, FUN))
+  out <- parallel::mclapply(X, FUN, mc.cores = mc_cores, mc.preschedule = TRUE)
+  failed <- vapply(out, inherits, logical(1), what = "try-error")
+  if (any(failed)) {
+    e <- out[[which(failed)[1]]]
+    cond <- attr(e, "condition")
+    stop("A parallel worker failed: ",
+         if (is.null(cond)) as.character(e) else conditionMessage(cond),
+         call. = FALSE)
+  }
+  missing <- vapply(out, is.null, logical(1))
+  if (length(out) != length(X) || any(missing)) {
+    stop(sum(missing), " of ", length(X), " parallel tasks returned no result ",
+         "(worker killed, probably out of memory). Re-run with a smaller ",
+         "n_cores or more memory.", call. = FALSE)
+  }
+  out
+}
+
+# Seeds for the Monte Carlo g-computation. Stages: 1 = posterior function draw
+# for a confounder model, 2 = posterior function draw for the outcome model,
+# 3 = residual noise / Bernoulli uniforms for a confounder, 4 = BKMR model fit.
+# The multipliers keep every (stage, t, li, j) combination distinct for
+# t, li <= 5 and j <= 9000, and `base` (currind, or the seed argument of the
+# plotting functions) separates analyses.
+.gbkmr_seed <- function(seed, stage, t = 0L, variable = 0L, draw = 0L, mc = 0L) {
+  value <- seed + stage * 1000003 + t * 10007 + variable * 1009 +
+    draw * 101 + mc
+  as.integer(value %% .Machine$integer.max)
+}
+
 #' Run g-BKMR panel analysis
 #'
 #' @param sim_popn Data frame in g-BKMR format (see \code{\link{prepare_gbkmr_data}}).
@@ -16,10 +67,17 @@
 #' @param sel Numeric vector. Post-burn-in MCMC indices for inference.
 #' @param iter Integer. MCMC iterations for time-varying confounder models.
 #' @param n_iter Integer or NULL. MCMC iterations for outcome model (default: iter).
-#' @param n_knots Integer. Number of knots for BKMR kernel approximation.
+#' @param n_knots Integer or NULL. Number of knots for the BKMR predictive-process
+#'   approximation under engine="bkmr". NULL (or 0) fits the exact Gaussian
+#'   process, as in Chai et al.; this is slower but gives wider, better
+#'   calibrated posterior intervals than the knot approximation.
 #' @param engine Character. Fitting engine: "bkmr" or "fastbkmr".
 #' @param n_subset Integer. Number of subsets for fastBKMR.
-#' @param n_cores Integer. Number of cores for fastBKMR parallel.
+#' @param n_cores Integer or NULL. Under engine="fastbkmr", cores for the
+#'   subset fits (default 10). Under engine="bkmr", forked workers
+#'   (\code{parallel::mclapply}) used to fit the BKMR models and to run the
+#'   Monte Carlo g-computation across posterior draws (default 1 = serial;
+#'   always 1 on Windows). Results do not depend on the number of workers.
 #' @param outcome_type Character. "continuous" (Gaussian BKMR, default) or
 #'   "binary" (probit BKMR via family="binomial"). Binary outcome requires
 #'   engine="bkmr" (fastBKMR does not yet support non-Gaussian outcomes).
@@ -29,10 +87,11 @@
 #'   low-exposure scenario. Overrides a_probs if provided.
 #' @param astar_vals Named numeric vector or NULL. Custom intervention values for
 #'   high-exposure scenario. Overrides a_probs if provided.
-#' @param verbose_every Integer. Print progress every N iterations.
+#' @param verbose_every Integer. Kept for backward compatibility; progress is
+#'   now reported once per model and per sampling stage.
 #'
 #' @return A list with causal effect estimate and model fits.
-#' @importFrom stats complete.cases quantile rnorm
+#' @importFrom stats complete.cases quantile rnorm runif
 #' @export
 run_gbkmr_panel <- function(
     sim_popn,
@@ -50,7 +109,7 @@ run_gbkmr_panel <- function(
     n_knots = 50,
     engine = c("bkmr", "fastbkmr"),
     n_subset = 10,
-    n_cores = 10,
+    n_cores = NULL,
     outcome_type = c("continuous", "binary"),
     a_probs = c(0.25, 0.75),
     a_vals = NULL,
@@ -61,6 +120,12 @@ run_gbkmr_panel <- function(
   outcome_type <- match.arg(outcome_type)
 
   if (is.null(n_iter)) n_iter <- iter
+  if (is.null(n_cores)) n_cores <- if (engine == "fastbkmr") 10L else 1L
+  use_knots <- !is.null(n_knots) && is.finite(n_knots) && n_knots > 0
+  if (!use_knots) n_knots <- NULL
+  # Forked workers for the standard-BKMR path (fits + Monte Carlo). Every
+  # worker sets its own seeds, so results are identical for any mc_cores.
+  mc_cores <- if (engine == "bkmr") .gbkmr_mc_cores(n_cores) else 1L
   if (!"Y" %in% names(sim_popn)) stop("Data must contain outcome variable 'Y'")
   if (!"id" %in% names(sim_popn)) stop("Data must contain 'id' column")
   if (is.null(n)) n <- nrow(sim_popn)
@@ -131,16 +196,20 @@ run_gbkmr_panel <- function(
     }
   }
 
-  .sample_pred <- function(fit, Znew, Xnew, sel_j, type = "link") {
-    if (is.list(fit) && !inherits(fit, "bkmrfit")) {
-      bkmr::SamplePred(fit[[sample(length(fit), 1)]],
-                        Znew = Znew, Xnew = Xnew, sel = sel_j,
-                        type = type)
-    } else {
-      bkmr::SamplePred(fit, Znew = Znew, Xnew = Xnew, sel = sel_j,
-                       type = type)
-    }
+  # Posterior-predictive draw of h(z) + x'beta at MCMC iteration sel_j for the
+  # paired rows (Znew_a[k, ], Znew_astar[k, ]), k = 1..K, with common random
+  # numbers across k (see .gbkmr_predict_blocks). Also returns the residual SD
+  # of the same posterior draw from the same fit.
+  .predict_pairs <- function(fit, Znew_a, Znew_astar, Xnew, sel_j, seed,
+                             type = "link") {
+    blocks <- lapply(seq_len(nrow(Znew_a)), function(k) {
+      rbind(Znew_a[k, ], Znew_astar[k, ])
+    })
+    res <- .gbkmr_predict_blocks(fit, blocks, Xnew, sel_j, seed, type)
+    list(a = res$pred[, 1], astar = res$pred[, 2], sigma = res$sigma)
   }
+
+  .lapply_mc <- function(X, FUN) .gbkmr_lapply_mc(X, FUN, mc_cores)
 
   .extract_beta <- function(fit, sel_idx) {
     if (is.list(fit) && !inherits(fit, "bkmrfit")) {
@@ -177,7 +246,7 @@ run_gbkmr_panel <- function(
     names(scaleinfo_list) <- names(fitkm_list)
   }
 
-  # --- Knot helper (only used for engine == "bkmr") ---
+  # --- Knot helper (only used for engine == "bkmr" with knots requested) ---
   .compute_knots <- function(Z_sc, n_knots) {
     n_unique <- nrow(unique(round(Z_sc, 10)))
     if (n_unique < nrow(Z_sc)) {
@@ -195,7 +264,19 @@ run_gbkmr_panel <- function(
   # =========================================================================
   # 1) Fit time-varying confounder models
   # =========================================================================
-  message("Fitting time-varying confounder models ...")
+  # The confounder models and the outcome model are fit independently of one
+  # another, so they are collected as jobs and fit together (in parallel when
+  # mc_cores > 1). Each job seeds its own RNG from currind so the fits do not
+  # depend on the number of workers or on the order of execution.
+  fit_jobs <- list()
+  .add_job <- function(name, y, Z_sc, X, it, knots, family) {
+    fit_jobs[[length(fit_jobs) + 1L]] <<- list(
+      name = name, y = y, Z_sc = Z_sc, X = X, it = it, knots = knots,
+      family = family,
+      seed = .gbkmr_seed(currind, 4L, draw = length(fit_jobs) + 1L)
+    )
+  }
+  message("Preparing time-varying confounder models ...")
 
   for (t in confounder_times) {
     y_cols <- confounder_names_at_t(t)
@@ -215,9 +296,8 @@ run_gbkmr_panel <- function(
     sc_scale  <- attr(Z_sc, "scaled:scale")
     scaleinfo_list[[t]] <- list(center = sc_center, scale = sc_scale)
 
-    knots_t <- if (engine == "bkmr") .compute_knots(Z_sc, n_knots) else NULL
+    knots_t <- if (engine == "bkmr" && use_knots) .compute_knots(Z_sc, n_knots) else NULL
 
-    fit_list_t <- vector("list", ncol(y_mat))
     for (li in seq_len(ncol(y_mat))) {
       y_vec <- y_mat[, li]
       y_ok  <- y_vec[rows_ok_ZX]
@@ -233,20 +313,19 @@ run_gbkmr_panel <- function(
       y_vec_fit <- y_vec[valid_idx]
 
       confounder_family <- if (confounder_types[[li]] == "binary") "binomial" else "gaussian"
-      message(sprintf("  L%d: fitting %s [engine=%s, Z=%d cols, n=%d, family=%s]",
+      message(sprintf("  L%d: %s [engine=%s, Z=%d cols, n=%d, family=%s]",
                       t, colnames(y_mat)[li], engine, ncol(Z_sc_fit),
                       length(y_vec_fit), confounder_family))
 
-      fit_list_t[[li]] <- .fit_model(y_vec_fit, Z_sc_fit, X_common_fit,
-                                      iter, knots_t, family = confounder_family)
+      .add_job(paste0("L", t, "_", li), y_vec_fit, Z_sc_fit, X_common_fit,
+               iter, knots_t, confounder_family)
     }
-    fitkm_list[[t]] <- fit_list_t
   }
 
   # =========================================================================
   # 2) Fit outcome model
   # =========================================================================
-  message("Fitting outcome model Y ...")
+  message("Preparing outcome model Y ...")
   Y <- dat_sim$Y
   valid_y <- !is.na(Y)
   if (any(!valid_y)) {
@@ -263,12 +342,30 @@ run_gbkmr_panel <- function(
   scale_info_y <- list(center = attr(Zy_sc, "scaled:center"),
                        scale  = attr(Zy_sc, "scaled:scale"))
 
-  knots_y <- if (engine == "bkmr") .compute_knots(Zy_sc, n_knots) else NULL
+  knots_y <- if (engine == "bkmr" && use_knots) .compute_knots(Zy_sc, n_knots) else NULL
 
   y_family <- if (outcome_type == "binary") "binomial" else "gaussian"
-  message(sprintf("  [engine=%s, Z=%d cols, n=%d, family=%s]",
+  message(sprintf("  Y [engine=%s, Z=%d cols, n=%d, family=%s]",
                   engine, ncol(Zy_sc), length(Y), y_family))
-  fit_y <- .fit_model(Y, Zy_sc, X_common, n_iter, knots_y, family = y_family)
+  .add_job("Y", Y, Zy_sc, X_common, n_iter, knots_y, y_family)
+
+  message(sprintf("Fitting %d BKMR model(s) [knots=%s, workers=%d] ...",
+                  length(fit_jobs), if (use_knots) n_knots else "none", mc_cores))
+  start_time_fit <- proc.time()
+  fits <- .lapply_mc(fit_jobs, function(job) {
+    set.seed(job$seed)
+    .fit_model(job$y, job$Z_sc, job$X, job$it, job$knots, family = job$family)
+  })
+  names(fits) <- vapply(fit_jobs, `[[`, character(1), "name")
+  message(sprintf("  fits done in %.1f min",
+                  (proc.time() - start_time_fit)["elapsed"] / 60))
+
+  for (t in confounder_times) {
+    fitkm_list[[t]] <- lapply(seq_along(confounder_basenames), function(li) {
+      fits[[paste0("L", t, "_", li)]]
+    })
+  }
+  fit_y <- fits[["Y"]]
 
   # =========================================================================
   # 3) Intervention levels (a / a*)
@@ -291,6 +388,14 @@ run_gbkmr_panel <- function(
   # =========================================================================
   # 4) Sequential time-varying confounder sampling
   # =========================================================================
+  # For posterior draw j and Monte Carlo sample k, a continuous confounder is
+  # drawn as  L = h_j(z_k) + x'beta_j + sigma_j * eps_jk,  eps_jk ~ N(0, 1),
+  # i.e. from the fitted conditional distribution, not at its mean (Chai et
+  # al.); a binary confounder is Bernoulli(Phi(h_j(z_k) + x'beta_j)). The
+  # posterior-function draws use common random numbers across k (see
+  # .gbkmr_predict_blocks); eps_jk and the Bernoulli uniforms are seeded per
+  # (analysis, draw, time, confounder) so the K values are distinct and the
+  # result is independent of mc_cores.
   message("\n=== Sampling time-varying confounders sequentially ===")
   start_time_global <- proc.time()
 
@@ -298,29 +403,27 @@ run_gbkmr_panel <- function(
     message(sprintf("\n--- Time point t=%d ---", t))
     start_time_t <- proc.time()
 
-    Z_names_t <- unlist(lapply(0:(t - 1), exposure_names_at_t))
-    if (t > 1) Z_names_t <- c(Z_names_t, unlist(lapply(1:(t - 1), confounder_names_at_t)))
-
     a_exp_t     <- unlist(lapply(0:(t - 1), function(s) a_vec[exposure_names_at_t(s)]))
     astar_exp_t <- unlist(lapply(0:(t - 1), function(s) astar_vec[exposure_names_at_t(s)]))
+    Za_exp_mat     <- matrix(a_exp_t,     nrow = K, ncol = length(a_exp_t),     byrow = TRUE)
+    Zastar_exp_mat <- matrix(astar_exp_t, nrow = K, ncol = length(astar_exp_t), byrow = TRUE)
 
     L_samp_a_t     <- vector("list", length(confounder_basenames))
     L_samp_astar_t <- vector("list", length(confounder_basenames))
 
     for (li in seq_along(confounder_basenames)) {
-      message(sprintf("  Sampling %s at t=%d", confounder_basenames[li], t))
+      message(sprintf("  Sampling %s at t=%d [%d draws x K=%d, workers=%d]",
+                      confounder_basenames[li], t, length(sel), K, mc_cores))
 
-      fit_li   <- fitkm_list[[t]][[li]]
-      scinfo_t <- scaleinfo_list[[t]]
+      fit_li    <- fitkm_list[[t]][[li]]
+      scinfo_t  <- scaleinfo_list[[t]]
+      is_binary <- confounder_types[[li]] == "binary"
 
-      L_a_mat     <- matrix(NA, nrow = length(sel), ncol = K)
-      L_astar_mat <- matrix(NA, nrow = length(sel), ncol = K)
-
-      for (j in seq_along(sel)) {
-        # Build historical time-varying confounder block
+      draws_j <- .lapply_mc(seq_along(sel), function(j) {
+        # Historical confounder block for this posterior draw
         if (t == 1) {
-          L_hist_a_j <- NULL
-          L_hist_astar_j <- NULL
+          aL_a_j         <- Za_exp_mat
+          astarL_astar_j <- Zastar_exp_mat
         } else {
           L_hist_a_blocks <- L_hist_astar_blocks <- list()
           for (tt in seq_len(t - 1L)) {
@@ -329,53 +432,38 @@ run_gbkmr_panel <- function(
               L_hist_astar_blocks[[length(L_hist_astar_blocks) + 1]] <- L_samp_astar[[tt]][[lj]][j, ]
             }
           }
-          L_hist_a_j     <- do.call(cbind, L_hist_a_blocks)
-          L_hist_astar_j <- do.call(cbind, L_hist_astar_blocks)
+          aL_a_j         <- cbind(Za_exp_mat,     do.call(cbind, L_hist_a_blocks))
+          astarL_astar_j <- cbind(Zastar_exp_mat, do.call(cbind, L_hist_astar_blocks))
         }
 
-        # Build full Z: [exposure block] + [historical time-varying confounder block]
-        Za_exp_mat     <- matrix(a_exp_t,     nrow = K, ncol = length(a_exp_t),     byrow = TRUE)
-        Zastar_exp_mat <- matrix(astar_exp_t, nrow = K, ncol = length(astar_exp_t), byrow = TRUE)
+        pred <- .predict_pairs(
+          fit_li,
+          Znew_a     = scale_like(aL_a_j,         scinfo_t$center, scinfo_t$scale),
+          Znew_astar = scale_like(astarL_astar_j, scinfo_t$center, scinfo_t$scale),
+          Xnew = X_predict_common, sel_j = sel[j],
+          seed = .gbkmr_seed(currind, 1L, t, li, j),
+          type = if (is_binary) "response" else "link"
+        )
 
-        if (is.null(L_hist_a_j)) {
-          aL_a_j         <- Za_exp_mat
-          astarL_astar_j <- Zastar_exp_mat
+        set.seed(.gbkmr_seed(currind, 3L, t, li, j))
+        if (is_binary) {
+          u_a     <- stats::runif(K)
+          u_astar <- stats::runif(K)
+          list(a     = as.numeric(u_a     < pmin(pmax(pred$a,     0), 1)),
+               astar = as.numeric(u_astar < pmin(pmax(pred$astar, 0), 1)))
         } else {
-          aL_a_j         <- cbind(Za_exp_mat,     L_hist_a_j)
-          astarL_astar_j <- cbind(Zastar_exp_mat, L_hist_astar_j)
+          eps_a     <- stats::rnorm(K)
+          eps_astar <- stats::rnorm(K)
+          list(a     = pred$a     + pred$sigma * eps_a,
+               astar = pred$astar + pred$sigma * eps_astar)
         }
+      })
 
-        for (k in 1:K) {
-          row_a     <- matrix(aL_a_j[k, ],         nrow = 1)
-          row_astar <- matrix(astarL_astar_j[k, ], nrow = 1)
-          newz    <- rbind(row_a, row_astar)
-          newz_sc <- scale_like(newz, scinfo_t$center, scinfo_t$scale)
+      L_samp_a_t[[li]]     <- do.call(rbind, lapply(draws_j, `[[`, "a"))
+      L_samp_astar_t[[li]] <- do.call(rbind, lapply(draws_j, `[[`, "astar"))
 
-          set.seed(j + 10000 + li)
-          if (confounder_types[[li]] == "binary") {
-            L_prob <- .sample_pred(fit_li, Znew = newz_sc,
-                                   Xnew = X_predict_common, sel_j = sel[j],
-                                   type = "response")
-            prob_a <- min(max(L_prob[, "znew1"], 0), 1)
-            prob_astar <- min(max(L_prob[, "znew2"], 0), 1)
-            L_a_mat[j, k]     <- stats::rbinom(1, 1, prob_a)
-            L_astar_mat[j, k] <- stats::rbinom(1, 1, prob_astar)
-          } else {
-            L_pred <- .sample_pred(fit_li, Znew = newz_sc,
-                                   Xnew = X_predict_common, sel_j = sel[j])
-            L_a_mat[j, k]     <- L_pred[, "znew1"]
-            L_astar_mat[j, k] <- L_pred[, "znew2"]
-          }
-        }
-
-        if (j %% verbose_every == 0) {
-          elapsed <- round((proc.time() - start_time_t)["elapsed"] / 60, 2)
-          message(sprintf("    iter %d/%d | %.2f min", j, length(sel), elapsed))
-        }
-      }
-
-      L_samp_a_t[[li]]     <- L_a_mat
-      L_samp_astar_t[[li]] <- L_astar_mat
+      message(sprintf("    done | %.2f min",
+                      (proc.time() - start_time_t)["elapsed"] / 60))
     }
 
     L_samp_a[[t]]     <- L_samp_a_t
@@ -385,62 +473,51 @@ run_gbkmr_panel <- function(
   # =========================================================================
   # 5) Sample outcome Y
   # =========================================================================
-  message("\n=== Sampling outcome Y ===")
+  # E[Y | a, L_k] under posterior draw j: h_j(z_k) + x'beta_j (continuous) or
+  # Phi(h_j(z_k) + x'beta_j) (binary, probit BKMR). No residual noise is added
+  # because the estimand is a mean.
+  message(sprintf("\n=== Sampling outcome Y [%d draws x K=%d, workers=%d] ===",
+                  length(sel), K, mc_cores))
   start_time_y <- proc.time()
 
-  Ya_mat     <- matrix(NA, nrow = length(sel), ncol = K)
-  Yastar_mat <- matrix(NA, nrow = length(sel), ncol = K)
+  pT <- length(all_exposure_names)
+  exp_a_block     <- matrix(a_vec[all_exposure_names],     nrow = K, ncol = pT, byrow = TRUE)
+  exp_astar_block <- matrix(astar_vec[all_exposure_names], nrow = K, ncol = pT, byrow = TRUE)
 
-  pT     <- length(all_exposure_names)
-  Ltotal <- length(all_confounder_names)
-
-  for (j in seq_along(sel)) {
-    exp_a_block     <- matrix(a_vec[all_exposure_names],     nrow = K, ncol = pT, byrow = TRUE)
-    exp_astar_block <- matrix(astar_vec[all_exposure_names], nrow = K, ncol = pT, byrow = TRUE)
-
+  y_draws_j <- .lapply_mc(seq_along(sel), function(j) {
     if (length(confounder_times) > 0 && length(confounder_basenames) > 0) {
       L_a_blocks <- L_astar_blocks <- list()
       for (t in confounder_times) {
         for (li in seq_along(confounder_basenames)) {
-          L_a_blocks[[length(L_a_blocks) + 1]] <- L_samp_a[[t]][[li]][j, ]
-          L_astar_blocks[[length(L_astar_blocks) + 1]] <-
-            L_samp_astar[[t]][[li]][j, ]
+          L_a_blocks[[length(L_a_blocks) + 1]]         <- L_samp_a[[t]][[li]][j, ]
+          L_astar_blocks[[length(L_astar_blocks) + 1]] <- L_samp_astar[[t]][[li]][j, ]
         }
       }
-      L_a_mat2 <- do.call(cbind, L_a_blocks)
-      L_astar_mat2 <- do.call(cbind, L_astar_blocks)
-
-      aL_a_j <- cbind(exp_a_block, L_a_mat2)
-      astarL_astar_j <- cbind(exp_astar_block, L_astar_mat2)
+      aL_a_j         <- cbind(exp_a_block,     do.call(cbind, L_a_blocks))
+      astarL_astar_j <- cbind(exp_astar_block, do.call(cbind, L_astar_blocks))
     } else {
-      aL_a_j <- exp_a_block
+      aL_a_j         <- exp_a_block
       astarL_astar_j <- exp_astar_block
     }
 
-    for (k in 1:K) {
-      newz    <- rbind(aL_a_j[k, ], astarL_astar_j[k, ])
-      newz_sc <- scale_like(newz, scale_info_y$center, scale_info_y$scale)
-
-      set.seed(j + 10000)
-      Y_jk <- .sample_pred(fit_y, Znew = newz_sc,
-                            Xnew = X_predict_common, sel_j = sel[j])
-      # For binary outcome (probit BKMR), SamplePred returns the linear
-      # predictor h(Z) + X*beta. Convert to probability scale via Phi().
-      if (outcome_type == "binary") {
-        Ya_mat[j, k]     <- stats::pnorm(Y_jk[, "znew1"])
-        Yastar_mat[j, k] <- stats::pnorm(Y_jk[, "znew2"])
-      } else {
-        Ya_mat[j, k]     <- Y_jk[, "znew1"]
-        Yastar_mat[j, k] <- Y_jk[, "znew2"]
-      }
+    pred <- .predict_pairs(
+      fit_y,
+      Znew_a     = scale_like(aL_a_j,         scale_info_y$center, scale_info_y$scale),
+      Znew_astar = scale_like(astarL_astar_j, scale_info_y$center, scale_info_y$scale),
+      Xnew = X_predict_common, sel_j = sel[j],
+      seed = .gbkmr_seed(currind, 2L, draw = j)
+    )
+    if (outcome_type == "binary") {
+      list(a = stats::pnorm(pred$a), astar = stats::pnorm(pred$astar))
+    } else {
+      list(a = pred$a, astar = pred$astar)
     }
+  })
 
-    if (j %% verbose_every == 0) {
-      elapsed <- round((proc.time() - start_time_y)["elapsed"] / 60, 2)
-      message(sprintf("  iter %d/%d | %.2f min", j, length(sel), elapsed))
-    }
-  }
-
+  Ya_mat     <- do.call(rbind, lapply(y_draws_j, `[[`, "a"))
+  Yastar_mat <- do.call(rbind, lapply(y_draws_j, `[[`, "astar"))
+  stopifnot(nrow(Ya_mat) == length(sel), nrow(Yastar_mat) == length(sel))
+  message(sprintf("  done | %.2f min", (proc.time() - start_time_y)["elapsed"] / 60))
   # =========================================================================
   # 6) Aggregate results
   # =========================================================================
@@ -486,6 +563,8 @@ run_gbkmr_panel <- function(
       n_knots = n_knots, n = n,
       currind = currind,
       engine = engine, n_subset = n_subset, n_cores = n_cores,
+      mc_cores = mc_cores,
+      confounder_noise = "residual",   # L drawn from fitted conditional, not its mean
       outcome_type = outcome_type,
       a_probs = a_probs, a_vals = a_vals, astar_vals = astar_vals,
       a_vec = a_vec, astar_vec = astar_vec,

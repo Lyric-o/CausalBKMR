@@ -20,7 +20,7 @@ run_gbkmr_panel(
   n_knots = 50,
   engine = c("bkmr", "fastbkmr"),
   n_subset = 10,
-  n_cores = 10,
+  n_cores = NULL,
   outcome_type = c("continuous", "binary"),
   a_probs = c(0.25, 0.75),
   a_vals = NULL,
@@ -55,13 +55,20 @@ Monte Carlo sampling under engine="bkmr".}
 
 \item{n_iter}{Integer or NULL. MCMC iterations for outcome model (default: iter).}
 
-\item{n_knots}{Integer. Number of knots for BKMR kernel approximation.}
+\item{n_knots}{Integer or NULL. Number of knots for the BKMR predictive-process
+approximation under engine="bkmr". NULL (or 0) fits the exact Gaussian
+process, as in Chai et al.; this is slower but gives wider, better
+calibrated posterior intervals than the knot approximation.}
 
 \item{engine}{Character. Fitting engine: "bkmr" or "fastbkmr".}
 
 \item{n_subset}{Integer. Number of subsets for fastBKMR.}
 
-\item{n_cores}{Integer. Number of cores for fastBKMR parallel.}
+\item{n_cores}{Integer or NULL. Under engine="fastbkmr", cores for the
+subset fits (default 10). Under engine="bkmr", forked workers
+(\code{parallel::mclapply}) used to fit the BKMR models and to run the
+Monte Carlo g-computation across posterior draws (default 1 = serial;
+always 1 on Windows). Results do not depend on the number of workers.}
 
 \item{outcome_type}{Character. "continuous" (Gaussian BKMR, default) or
 "binary" (probit BKMR via family="binomial"). Binary outcome requires
@@ -76,7 +83,8 @@ low-exposure scenario. Overrides a_probs if provided.}
 \item{astar_vals}{Named numeric vector or NULL. Custom intervention values for
 high-exposure scenario. Overrides a_probs if provided.}
 
-\item{verbose_every}{Integer. Print progress every N iterations.}
+\item{verbose_every}{Integer. Kept for backward compatibility; progress is
+now reported once per model and per sampling stage.}
 }
 \value{
 A list with causal effect estimate and model fits.

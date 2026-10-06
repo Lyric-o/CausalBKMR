@@ -1,6 +1,6 @@
 Package: causalBKMR
 Title: Causal Inference for Time-Varying Environmental Mixtures via g-BKMR
-Version: 0.1.0
+Version: 0.1.1
 Authors@R: c(
     person("Yanran", "Li", role = c("aut", "cre"), email = "yl5465@cumc.columbia.edu"),
     person("Arce", "Domingo-Relloso", role = "aut"),
@@ -22,10 +22,11 @@ Imports:
     bkmr,
     dplyr,
     fields,
-    ggplot2
+    ggplot2,
+    parallel
 Suggests:
     fbkmr,
-    parallel,
+    withr,
     mvtnorm,
     knitr,
     rmarkdown,

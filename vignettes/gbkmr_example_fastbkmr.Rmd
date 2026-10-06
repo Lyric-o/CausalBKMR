@@ -98,7 +98,9 @@ fit_fast <- gbkmr_run(
 
 `n_subset` controls how many subsets are fit. `n_cores` controls how many
 parallel workers are requested. If parallel execution is unavailable,
-the implementation falls back to a sequential run.
+the implementation falls back to a sequential run. (With `engine = "bkmr"`,
+`n_cores` instead forks workers for the BKMR fits and the Monte Carlo
+g-computation.)
 
 ## Compare Engines on a Subset
 
@@ -141,7 +143,9 @@ diagnostics, intervention support, and model settings.
 
 - Binary outcomes and binary time-dependent confounders require
   `engine = "bkmr"`.
-- `n_knots` applies to standard BKMR only.
+- `n_knots` applies to standard BKMR only; `n_knots = NULL` fits the exact
+  Gaussian process (wider, better calibrated intervals than the knot
+  approximation).
 - `fastbkmr` is optional; `engine = "auto"` falls back to `bkmr` when
   `fbkmr` is not installed.
 - The raw fit object returned by `fit$raw_results` differs by engine:
